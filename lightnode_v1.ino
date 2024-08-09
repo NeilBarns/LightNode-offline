@@ -387,7 +387,6 @@ void manageLEDTiming() {
         if (isLEDOn || isTesting) 
         {
           digitalWrite(D1, LOW);
-          isTesting = false;
           isLEDOn = false;
           saveState(); // Save state whenever the LED state changes
           notifyServerOfTimeEnd();
@@ -552,7 +551,18 @@ void notifyServerOfTimeEnd() {
         http.begin(client, fullURL); 
         http.addHeader(F("Content-Type"), F("application/json"));
 
-        String payload = F("{\"device_id\": \"") + String(id) + F("\"}");
+        String payload = F("{");
+        payload += F("\"device_id\":\"") + String(id) + F("\",");
+        if (isTesting)
+        {
+          isTesting = false;
+          payload += F("\"from_testing\":1");
+        }
+        else
+        {
+          payload += F("\"from_testing\":0");
+        }
+        payload += F("}");
         
         int httpResponseCode = http.POST(payload);
         if (httpResponseCode > 0) {
