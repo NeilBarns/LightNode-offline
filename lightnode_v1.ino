@@ -12,6 +12,7 @@
 char ssid[32] = "";
 char password[32] = ""; 
 char serverAppDomain[32] = ""; 
+char serverAppPort[6] = "";
 const char* registerDeviceURL = "/api/device/insert";
 const char* stopDeviceTimeURL = "/api/device-time/end";
 char deviceName[32] = "";
@@ -33,6 +34,7 @@ String APSSID = manufacturerDeviceName + "-" + versionNumber + "-AP";
 String APPass = "L1ghtN0d3@2024";
 const char* mDNSHostname = "110lightnode"; 
 const char* otaPassword = "L1ghtN0d3@2024";
+char hostURL[128];
 
 // SPIFFS
 const char* timeFilePath = "/time.txt";
@@ -134,7 +136,7 @@ void loop() {
   server.handleClient();
   manageLEDTiming();
   ArduinoOTA.handle(); // Handle OTA updates
-  checkWiFiConnection(); // Ensure WiFi is connected
+//  checkWiFiConnection(); // Ensure WiFi is connected
 }
 
 
@@ -173,40 +175,46 @@ void connectToWiFi() {
 }
 
 void startMDNS() {
-//  if (MDNS.begin(mDNSHostname)) {
-//    Serial.println("MDNS responder started");
-//    MDNS.addService("http", "tcp", 80);
-//  } else {
-//    Serial.println("Error setting up MDNS responder!");
-//  }
+  if (MDNS.begin(mDNSHostname)) {
+    Serial.println("MDNS responder started");
+    MDNS.addService("http", "tcp", 80);
+  } else {
+    Serial.println("Error setting up MDNS responder!");
+  }
 }
 
 void loadConfig() {
   EEPROM.get(0, ssid);
   EEPROM.get(32, password);
   EEPROM.get(64, serverAppDomain);
-  EEPROM.get(96, deviceName); 
-  EEPROM.get(128, isRegistered); 
-  EEPROM.get(129, ipString);
-  EEPROM.get(145, gatewayString);
-  EEPROM.get(161, subnetString);
-  EEPROM.get(177, isDisabled);
-  EEPROM.get(178, isPaused);
-  EEPROM.get(179, isFree);
+  EEPROM.get(96, serverAppPort);
+  EEPROM.get(128, deviceName); 
+  EEPROM.get(160, isRegistered); 
+  EEPROM.get(161, ipString);
+  EEPROM.get(177, gatewayString);
+  EEPROM.get(193, subnetString);
+  EEPROM.get(209, isDisabled);
+  EEPROM.get(210, isPaused);
+  EEPROM.get(211, isFree);
+  EEPROM.get(224, deviceId); // Load deviceId from address 224
+
+  snprintf(hostURL, sizeof(hostURL), "http://%s:%s", serverAppDomain, serverAppPort);
 }
 
 void saveConfig() {
   EEPROM.put(0, ssid);
   EEPROM.put(32, password);
   EEPROM.put(64, serverAppDomain);
-  EEPROM.put(96, deviceName); 
-  EEPROM.put(128, isRegistered); 
-  EEPROM.put(129, ipString);
-  EEPROM.put(145, gatewayString);
-  EEPROM.put(161, subnetString);
-  EEPROM.put(177, isDisabled);
-  EEPROM.put(178, isPaused);
-  EEPROM.put(179, isFree);
+  EEPROM.put(96, serverAppPort);
+  EEPROM.put(128, deviceName); 
+  EEPROM.put(160, isRegistered); 
+  EEPROM.put(161, ipString);
+  EEPROM.put(177, gatewayString);
+  EEPROM.put(193, subnetString);
+  EEPROM.put(209, isDisabled);
+  EEPROM.put(210, isPaused);
+  EEPROM.put(211, isFree);
+  EEPROM.put(224, deviceId); // Save deviceId at address 224
   EEPROM.commit();
 }
 
@@ -221,6 +229,7 @@ void setupServer() {
       strncpy(ssid, server.arg("ssid").c_str(), sizeof(ssid));
       strncpy(password, server.arg("password").c_str(), sizeof(password));
       strncpy(serverAppDomain, server.arg("hostname").c_str(), sizeof(serverAppDomain));
+      strncpy(serverAppPort, server.arg("port").c_str(), sizeof(serverAppPort));
       strncpy(deviceName, server.arg("device_name").c_str(), sizeof(deviceName));
       strncpy(ipString, server.arg("ip").c_str(), sizeof(ipString));
       strncpy(gatewayString, server.arg("gateway").c_str(), sizeof(gatewayString));
@@ -285,21 +294,21 @@ void setupServer() {
 
   server.on("/api/disable", HTTP_GET, []() {
     isDisabled = true;
-    EEPROM.put(177, isDisabled);
+    EEPROM.put(209, isDisabled);
     EEPROM.commit();
-    server.send(200, "text/plain", "Device disablaccountPersonList = ed");
+    server.send(200, "text/plain", "Device disabled");
   });
 
   server.on("/api/enable", HTTP_GET, []() {
     isDisabled = false;
-    EEPROM.put(177, isDisabled);
+    EEPROM.put(209, isDisabled);
     EEPROM.commit();
     server.send(200, "text/plain", "Device enabled");
   });
 
   server.on("/api/pause", HTTP_GET, []() {
     isPaused = true;
-    EEPROM.put(177, isPaused);
+    EEPROM.put(210, isPaused);
     EEPROM.commit();
     digitalWrite(D1, LOW);
     isLEDOn = false;
@@ -310,7 +319,7 @@ void setupServer() {
 
   server.on("/api/resume", HTTP_GET, []() {
     isPaused = false;
-    EEPROM.put(177, isPaused);
+    EEPROM.put(210, isPaused);
     EEPROM.commit();
     digitalWrite(D1, HIGH);
     isLEDOn = true;
@@ -322,7 +331,7 @@ void setupServer() {
   server.on("/api/startfree", HTTP_GET, []() {
     Serial.println("Free light");
     isFree = true;
-    EEPROM.put(179, isFree);
+    EEPROM.put(211, isFree);
     EEPROM.commit();
     digitalWrite(D1, HIGH);
     server.send(200, "text/plain", "Device free light");
@@ -331,7 +340,7 @@ void setupServer() {
   server.on("/api/stopfree", HTTP_GET, []() {
     Serial.println("Stop Free light");
     isFree = false;
-    EEPROM.put(179, isFree);
+    EEPROM.put(211, isFree);
     EEPROM.commit();
     digitalWrite(D1, LOW);
     server.send(200, "text/plain", "Device free light");
@@ -378,7 +387,6 @@ void manageLEDTiming() {
         if (isLEDOn || isTesting) 
         {
           digitalWrite(D1, LOW);
-          isTesting = false;
           isLEDOn = false;
           saveState(); // Save state whenever the LED state changes
           notifyServerOfTimeEnd();
@@ -421,9 +429,9 @@ void resetEEPROMSPIFFS() {
   }
   EEPROM.commit();
 
-  createSPIFFSFile();
-  
-  Serial.println("EEPROM reset complete");
+  //createSPIFFSFile();
+  SPIFFS.end();
+  Serial.println("EEPROM and SPIFFS reset complete");
 }
 
 void createSPIFFSFile() {
@@ -461,7 +469,8 @@ String generateHTML() {
     page += "<form action='/save' method='POST'>";
     page += "<b>SSID:</b> <input type='text' name='ssid' placeholder='WiFi SSID' value='" + String(ssid) + "'><br>";
     page += "<b>Password:</b> <input type='text' name='password' placeholder='WiFi password' value='" + String(password) + "'><br>";
-    page += "<b>Server mDNS:</b> <input type='text' name='hostname' placeholder='Server hostname' value='" + String(serverAppDomain) + "'><br>";
+    page += "<b>Server IP:</b> <input type='text' name='hostname' placeholder='Server IP' value='" + String(serverAppDomain) + "'><br>";
+    page += "<b>Server Port:</b> <input type='text' name='port' placeholder='Server port' value='" + String(serverAppPort) + "'><br>";
     page += "<b>Device name:</b> <input type='text' name='device_name' placeholder='Device name' value='" + String(deviceName) + "'><br>";
     page += "<div class='divider'></div>";
     page += "<b>Static IP:</b> <input type='text' name='ip' placeholder='192.168.18.184' value='" + String(ipString) + "'><br>";
@@ -478,8 +487,8 @@ void registerDevice() {
     WiFiClient client;
     HTTPClient http;
 
-    Serial.println(String(serverAppDomain) + registerDeviceURL);
-    http.begin(client, String(serverAppDomain) + registerDeviceURL); 
+    Serial.println(String(hostURL) + registerDeviceURL);
+    http.begin(client, String(hostURL) + registerDeviceURL); 
     http.addHeader(F("Content-Type"), F("application/json"));
 
     String payload = F("{");
@@ -501,12 +510,15 @@ void registerDevice() {
       DeserializationError error = deserializeJson(doc, response);
 
       if (!error) {
-        int tmp_deviceId = doc[F("device_id")];
-        Serial.println(F("Device ID: ") + String(tmp_deviceId));
+        int tmp_deviceId = doc["device_id"];
+        Serial.println("Response Device ID: " + String(tmp_deviceId));
 
         // Save the device ID to EEPROM
-        EEPROM.put(200, tmp_deviceId); // Assuming the EEPROM address is 200
+        EEPROM.put(224, tmp_deviceId); // Save deviceId at address 224
         EEPROM.commit();
+
+        EEPROM.get(224, deviceId);
+        Serial.println("Stored Device ID: " + String(deviceId));
       } else {
         Serial.println(F("Failed to parse JSON response"));
       }
@@ -529,13 +541,28 @@ void notifyServerOfTimeEnd() {
         WiFiClient client;
         HTTPClient http;
 
-        EEPROM.get(200, deviceId);
-        Serial.println(F("deviceId:") + String(deviceId));
+        int id;
+        EEPROM.get(224, id); // Load deviceId from address 224
+        Serial.println(F("deviceId:") + String(id));
         
-        http.begin(client, String(serverAppDomain) + stopDeviceTimeURL); 
+        String fullURL = String(hostURL) + stopDeviceTimeURL;
+        Serial.println("Full URL: " + fullURL);
+        
+        http.begin(client, fullURL); 
         http.addHeader(F("Content-Type"), F("application/json"));
 
-        String payload = F("{\"device_id\": \"") + String(deviceId) + F("\"}");
+        String payload = F("{");
+        payload += F("\"device_id\":\"") + String(id) + F("\",");
+        if (isTesting)
+        {
+          isTesting = false;
+          payload += F("\"from_testing\":1");
+        }
+        else
+        {
+          payload += F("\"from_testing\":0");
+        }
+        payload += F("}");
         
         int httpResponseCode = http.POST(payload);
         if (httpResponseCode > 0) {
@@ -558,7 +585,6 @@ void saveState() {
   EEPROM.commit();
   Serial.println("Saved state: millis = " + String(millis()) + ", storedTimeInSeconds = " + String(storedTimeInSeconds));
 }
-
 
 void loadState() {
   EEPROM.get(300, isLEDOn);
