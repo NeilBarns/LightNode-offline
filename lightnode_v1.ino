@@ -58,7 +58,6 @@ Ticker ticker;
 
 void setup() {
   Serial.begin(115200);
-
   EEPROM.begin(512);
   if (!SPIFFS.begin()) {
     Serial.println(F("Failed to mount file system"));
@@ -168,11 +167,6 @@ void connectToWiFi() {
     digitalWrite(LED_BUILTIN, LOW);
   } else {
     Serial.println(F("Failed to connect to WiFi. Starting AP mode."));
-
-    IPAddress local_AP_IP(192, 168, 10, 3); // Desired IP address
-    IPAddress local_AP_gateway(192, 168, 10, 1);  // Gateway
-    IPAddress local_AP_subnet(255, 255, 255, 0);  // Subnet mask
-    WiFi.softAPConfig(local_AP_IP, local_AP_gateway, local_AP_subnet);
     WiFi.softAP(APSSID, APPass);
     Serial.print(F("AP IP address: "));
     Serial.println(WiFi.softAPIP());
@@ -436,9 +430,9 @@ void resetEEPROMSPIFFS() {
   }
   EEPROM.commit();
 
-  createSPIFFSFile();
-  
-  Serial.println("EEPROM reset complete");
+  //createSPIFFSFile();
+  SPIFFS.end();
+  Serial.println("EEPROM and SPIFFS reset complete");
 }
 
 void createSPIFFSFile() {
