@@ -29,7 +29,7 @@ char gatewayString[16] = "";
 char subnetString[16] = "";
 
 String manufacturerDeviceName = "Lightnode";
-String versionNumber = "1.0.1-0";
+String versionNumber = "1.0.0-0";
 String APSSID = manufacturerDeviceName + "-" + versionNumber + "-AP";
 String APPass = "L1ghtN0d3@2024";
 const char* mDNSHostname = "110lightnode"; 
@@ -58,6 +58,11 @@ Ticker ticker;
 
 void setup() {
   Serial.begin(115200);
+
+  IPAddress local_IP(192, 168, 10, 3); // Desired IP address
+  IPAddress gateway(192, 168, 10, 1);  // Gateway
+  IPAddress subnet(255, 255, 255, 0);  // Subnet mask
+  
   EEPROM.begin(512);
   if (!SPIFFS.begin()) {
     Serial.println(F("Failed to mount file system"));
@@ -167,6 +172,7 @@ void connectToWiFi() {
     digitalWrite(LED_BUILTIN, LOW);
   } else {
     Serial.println(F("Failed to connect to WiFi. Starting AP mode."));
+    WiFi.softAPConfig(local_IP, gateway, subnet);
     WiFi.softAP(APSSID, APPass);
     Serial.print(F("AP IP address: "));
     Serial.println(WiFi.softAPIP());
