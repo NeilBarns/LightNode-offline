@@ -14,6 +14,7 @@ char password[32] = "";
 char serverAppDomain[32] = ""; 
 char serverAppPort[6] = "";
 const char* registerDeviceURL = "/api/device/insert";
+const char* updateDeviceURL = "/api/device/update";
 const char* stopDeviceTimeURL = "/api/device-time/end";
 char deviceName[32] = "";
 int deviceId = 0;
@@ -29,7 +30,7 @@ char gatewayString[16] = "";
 char subnetString[16] = "";
 
 String manufacturerDeviceName = "Lightnode";
-String versionNumber = "1.0.0-0";
+String versionNumber = "1.0.2-0";
 String APSSID = manufacturerDeviceName + "-" + versionNumber + "-AP";
 String APPass = "L1ghtN0d3@2024";
 const char* mDNSHostname = "110lightnode"; 
@@ -56,6 +57,12 @@ unsigned long offDuration = 0; // Time duration the device was off
 // Watchdog timer setup
 Ticker ticker;
 
+// Pin for the button
+const int buttonPin = D2;
+
+// Last state of the button
+bool lastButtonState = HIGH;
+
 void setup() {
   Serial.begin(115200);
   EEPROM.begin(512);
@@ -65,6 +72,7 @@ void setup() {
   }
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(D1, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP); // Set button pin as input with internal pull-up
   digitalWrite(D1, LOW);
   loadConfig();
   connectToWiFi();
@@ -136,9 +144,9 @@ void loop() {
   server.handleClient();
   manageLEDTiming();
   ArduinoOTA.handle(); // Handle OTA updates
+  checkButtonPress(); // Check if the button is pressed
 //  checkWiFiConnection(); // Ensure WiFi is connected
 }
-
 
 void connectToWiFi() {
   local_IP.fromString(ipString);
@@ -247,7 +255,7 @@ void setupServer() {
 
   server.on("/api/reset", HTTP_DELETE, []() {
     digitalWrite(D1, LOW);
-    resetEEPROMSPIFFS();
+        resetEEPROMSPIFFS();
     server.send(200, "text/html", "<html><body><h1>Device Reset</h1><p>Device has been reset successfully.</p></body></html>");
     delay(2000);
     ESP.restart();
@@ -344,6 +352,23 @@ void setupServer() {
     EEPROM.commit();
     digitalWrite(D1, LOW);
     server.send(200, "text/plain", "Device free light");
+  });
+
+  server.on("/api/updateDeviceName", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+      String newDeviceName = server.arg("plain"); // Get the new device name from the request body
+      if (newDeviceName.length() > 0 && newDeviceName.length() < sizeof(deviceName)) {
+        newDeviceName.toCharArray(deviceName, sizeof(deviceName)); // Copy new device name into deviceName variable
+        EEPROM.put(128, deviceName); // Save the updated device name to EEPROM
+        EEPROM.commit();
+        Serial.println("Device name updated to: " + String(deviceName));
+        server.send(200, "text/plain", "Device name updated successfully");
+      } else {
+        server.send(400, "text/plain", "Invalid device name length");
+      }
+    } else {
+      server.send(400, "text/plain", "No device name provided");
+    }
   });
 
   server.begin();
@@ -457,24 +482,24 @@ String generateHTML() {
     page += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f4f9; text-align: center; }";
     page += "h1 { color: #333; }";
     page += "form { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); text-align: left; }";
-    page += "input[type='text'] { box-sizing: border-box; width: 100%; padding: 8px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; }";
-    page += "input[type='submit'] { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }";
-    page += "input[type='submit']:hover { background-color: #45a049; }";
+    page += "input[type='text'], button { box-sizing: border-box; width: 100%; padding: 8px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; }";
+    page += "input[type='submit'], button { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }";
+    page += "input[type='submit']:hover, button:hover { background-color: #45a049; }";
     page += ".version { font-size: 0.9em; color: #777; margin-bottom: 20px; }";
     page += ".divider { border: 1px solid lightgray; margin: 15px 0px; }";
     page += "</style>";
     page += "</head><body>";
     page += "<h1>Device Configuration</h1>";
-    page += "<div class='version'>" + manufacturerDeviceName +  "  <span id='versionNumber'>" + versionNumber + "</span></div>";
+    page += "<div class='version'>" + manufacturerDeviceName + "  <span id='versionNumber'>" + versionNumber + "</span></div>";
     page += "<form action='/save' method='POST'>";
     page += "<b>SSID:</b> <input type='text' name='ssid' placeholder='WiFi SSID' value='" + String(ssid) + "'><br>";
     page += "<b>Password:</b> <input type='text' name='password' placeholder='WiFi password' value='" + String(password) + "'><br>";
     page += "<b>Server IP:</b> <input type='text' name='hostname' placeholder='Server IP' value='" + String(serverAppDomain) + "'><br>";
     page += "<b>Server Port:</b> <input type='text' name='port' placeholder='Server port' value='" + String(serverAppPort) + "'><br>";
-    page += "<b>Device name:</b> <input type='text' name='device_name' placeholder='Device name' value='" + String(deviceName) + "'><br>";
+        page += "<b>Device name:</b> <input type='text' name='device_name' placeholder='Device name' value='" + String(deviceName) + "'><br>";
     page += "<div class='divider'></div>";
-    page += "<b>Static IP:</b> <input type='text' name='ip' placeholder='192.168.18.184' value='" + String(ipString) + "'><br>";
-    page += "<b>Gateway:</b> <input type='text' name='gateway' placeholder='192.168.18.1' value='" + String(gatewayString) + "'><br>";
+    page += "<b>Static IP:</b> <input type='text' name='ip' placeholder='192.168.10.3' value='" + String(ipString) + "'><br>";
+    page += "<b>Gateway:</b> <input type='text' name='gateway' placeholder='192.168.10.1' value='" + String(gatewayString) + "'><br>";
     page += "<b>Subnet:</b> <input type='text' name='subnet' placeholder='255.255.255.0' value='" + String(subnetString) + "'><br>";
     page += "<input type='submit' value='Save'>";
     page += "</form>";
@@ -487,11 +512,27 @@ void registerDevice() {
     WiFiClient client;
     HTTPClient http;
 
-    Serial.println(String(hostURL) + registerDeviceURL);
-    http.begin(client, String(hostURL) + registerDeviceURL); 
-    http.addHeader(F("Content-Type"), F("application/json"));
+    int checkId = 0;
+    EEPROM.get(224, checkId);
 
     String payload = F("{");
+
+    if (checkId > 0)
+    {
+      Serial.println(String(hostURL) + updateDeviceURL);
+      http.begin(client, String(hostURL) + updateDeviceURL); 
+
+      payload += F("\"DeviceID\":\"") + String(checkId) + F("\",");
+    }
+    else 
+    {
+      Serial.println(String(hostURL) + registerDeviceURL);
+      http.begin(client, String(hostURL) + registerDeviceURL); 
+    }
+
+    
+    http.addHeader(F("Content-Type"), F("application/json"));
+
     payload += F("\"DeviceName\":\"") + String(deviceName) + F("\",");
     payload += F("\"IPAddress\":\"") + WiFi.localIP().toString() + F("\",");
     payload += F("\"DeviceStatusID\":1"); // Set initial status as 1/Pending Configuration
@@ -616,4 +657,28 @@ void checkWiFiConnection() {
     Serial.println(F("WiFi connection lost. Reconnecting..."));
     connectToWiFi();
   }
+}
+
+// Function to check if the button is pressed
+void checkButtonPress() {
+  bool currentButtonState = digitalRead(buttonPin);
+  
+  if (currentButtonState == LOW && lastButtonState == HIGH) { // Button pressed
+    Serial.println(F("Button pressed. Switching to AP mode."));
+    switchToAPMode();
+  }
+  
+  lastButtonState = currentButtonState;
+}
+
+// Function to switch to AP mode
+void switchToAPMode() {
+  // Clear stored WiFi credentials
+  memset(ssid, 0, sizeof(ssid));
+  memset(password, 0, sizeof(password));
+  saveConfig();
+
+  // Restart device to start in AP mode
+  delay(1000);
+  ESP.restart();
 }
