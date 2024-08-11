@@ -30,7 +30,7 @@ char gatewayString[16] = "";
 char subnetString[16] = "";
 
 String manufacturerDeviceName = "Lightnode";
-String versionNumber = "1.0.1-0";
+String versionNumber = "1.0.0-0";
 String APSSID = manufacturerDeviceName + "-" + versionNumber + "-AP";
 String APPass = "L1ghtN0d3@2024";
 const char* mDNSHostname = "110lightnode"; 
@@ -134,6 +134,7 @@ void setup() {
   // Set up a Ticker to call a function that resets the watchdog timer every 30 minutes
   ticker.attach(1800, []() {
     saveState();
+    logMessage("INFO: Watchdog maintenance");
     Serial.println(F("Restarting"));
     ESP.restart();
   });
@@ -491,13 +492,6 @@ server.on("/api/span", HTTP_GET, []() {
 
 
   server.on("/api/enable", HTTP_GET, []() {
-    isDisabled = false;
-    EEPROM.put(209, isDisabled);
-    EEPROM.commit();
-    server.send(200, "text/plain", "Device enabled");
-  });
-
-  server.on("/api/enable", HTTP_GET, []() {
     bool errorOccurred = false;
     String errorMessage;
 
@@ -517,6 +511,41 @@ server.on("/api/span", HTTP_GET, []() {
         server.send(500, "text/plain", "Failed to enable the device.");
     } else {
         server.send(200, "text/plain", "Device enabled");
+    }
+});
+
+server.on("/api/pause", HTTP_GET, []() {
+    bool errorOccurred = false;
+    String errorMessage;
+
+    // Attempt to pause the device
+    isPaused = true;
+    EEPROM.put(210, isPaused);
+
+    // Check if EEPROM commit for isPaused is successful
+    if (!EEPROM.commit()) {
+        errorMessage = "Failed to commit pause state to EEPROM.";
+        logMessage("Error: " + errorMessage);
+        errorOccurred = true;
+    }
+
+    // Attempt to turn off the LED
+    digitalWrite(D1, LOW);
+    isLEDOn = false;
+    EEPROM.put(300, isLEDOn);
+
+    // Check if EEPROM commit for isLEDOn is successful
+    if (!EEPROM.commit()) {
+        errorMessage = "Failed to commit LED state to EEPROM.";
+        logMessage("Error: " + errorMessage);
+        errorOccurred = true;
+    }
+
+    // Respond to the client
+    if (errorOccurred) {
+        server.send(500, "text/plain", "Failed to pause device time.");
+    } else {
+        server.send(200, "text/plain", "Device paused time");
     }
 });
 
@@ -673,6 +702,20 @@ server.on("/api/span", HTTP_GET, []() {
     server.send(200, "text/plain", logContent);
   });
 
+server.on("/api/clearlogs", HTTP_DELETE, []() {
+    if (SPIFFS.exists("/logs.txt")) {
+        if (SPIFFS.remove("/logs.txt")) {
+            server.send(200, "text/plain", "Log file cleared successfully.");
+            Serial.println("Log file cleared successfully.");
+        } else {
+            server.send(500, "text/plain", "Failed to clear log file.");
+            Serial.println("Failed to clear log file.");
+        }
+    } else {
+        server.send(404, "text/plain", "Log file not found.");
+        Serial.println("Log file not found.");
+    }
+});
 
   server.begin();
   Serial.println("HTTP server started");
@@ -823,6 +866,7 @@ String generateHTML() {
     page += ".version { font-size: 0.9em; color: #777; margin-bottom: 20px; }";
     page += ".divider { border: 1px solid lightgray; margin: 15px 0px; }";
     page += "#logs { max-height: 300px; overflow-y: auto; margin-top: 20px; background-color: #fff; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }";
+    page += "#clearLogsBtn { display: none; margin-top: 10px; }"; // Initially hidden
     page += "</style>";
     page += "</head><body>";
     page += "<h1>Device Configuration</h1>";
@@ -841,19 +885,34 @@ String generateHTML() {
     page += "</form>";
     page += "<button onclick='fetchLogs()'>Show Logs</button>";
     page += "<div id='logs'></div>"; // Container to display logs
+    page += "<button id='clearLogsBtn' onclick='clearLogs()'>Clear Error Log</button>"; // Button to clear logs
     page += "<script>";
     page += "function fetchLogs() {";
     page += "  fetch('/api/logs')"; // Fetch logs from the endpoint
     page += "    .then(response => response.text())";
     page += "    .then(data => {";
     page += "      document.getElementById('logs').innerHTML = `<pre>${data}</pre>`;";
+    page += "      document.getElementById('clearLogsBtn').style.display = 'block';"; // Show clear logs button
     page += "    })";
     page += "    .catch(error => console.error('Error fetching logs:', error));";
+    page += "}";
+    page += "function clearLogs() {";
+    page += "  fetch('/api/clearlogs', { method: 'DELETE' })"; // Send DELETE request to clear logs
+    page += "    .then(response => {";
+    page += "      if (response.ok) {";
+    page += "        document.getElementById('logs').innerHTML = '<pre>Logs cleared.</pre>';";
+    page += "        console.log('Logs cleared successfully');";
+    page += "      } else {";
+    page += "        console.error('Failed to clear logs');";
+    page += "      }";
+    page += "    })";
+    page += "    .catch(error => console.error('Error clearing logs:', error));";
     page += "}";
     page += "</script>";
     page += "</body></html>";
     return page;
 }
+
 
 
 void registerDevice() {
