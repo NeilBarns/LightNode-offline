@@ -8,6 +8,11 @@
 #include <Ticker.h>
 #include <ArduinoOTA.h>
 
+#define PUSH_BUTTON_PIN D3
+#define AP_BUTTON_PIN D2
+#define AP_LED_PIN D4
+#define PROCESSING_LED_PIN D8
+
 // Configuration parameters
 char ssid[32] = "";
 char password[32] = ""; 
@@ -30,7 +35,7 @@ char gatewayString[16] = "";
 char subnetString[16] = "";
 
 String manufacturerDeviceName = "Lightnode";
-String versionNumber = "1.0.0-0";
+String versionNumber = "1.0.1-0";
 String APSSID = manufacturerDeviceName + "-" + versionNumber + "-AP";
 String APPass = "L1ghtN0d3@2024";
 const char* mDNSHostname = "110lightnode"; 
@@ -51,18 +56,23 @@ bool isPaused = false; //State of paused time
 bool isFree = false; //State of free light
 int storedTimeInSeconds = 0;
 
+bool isButtonCurrentlyPressed = false; // State of the button press
+bool previousButtonState = HIGH; // Last known state of the button
+unsigned long buttonDebounceStartTime = 0;
+const unsigned long APDebounceDelay = 50; // Debounce time in milliseconds
+unsigned long APLastDebounceTime = 0;
+bool APButtonPressed = false;
+unsigned int watchdogIntervalMinutes = 10;
+
 // Time tracking
 unsigned long lastMillis = 0; // Last recorded time
 unsigned long offDuration = 0; // Time duration the device was off
 
 // Watchdog timer setup
-Ticker ticker;
-
-// Pin for the button
-const int buttonPin = D2;
+Ticker restartTicker;
 
 // Last state of the button
-bool lastButtonState = HIGH;
+bool APLastButtonState = HIGH;
 
 void setup() {
   Serial.begin(115200);
@@ -71,14 +81,30 @@ void setup() {
     Serial.println(F("Failed to mount file system"));
     return;
   }
+//  pinMode(PUSH_BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
   pinMode(D1, OUTPUT);
-  pinMode(buttonPin, INPUT_PULLUP); // Set button pin as input with internal pull-up
+  digitalWrite(D1, LOW);
+  pinMode(AP_LED_PIN, OUTPUT);
+  digitalWrite(AP_LED_PIN, LOW);
+  pinMode(PROCESSING_LED_PIN, OUTPUT);
+  digitalWrite(PROCESSING_LED_PIN, LOW);
+  pinMode(PUSH_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(AP_BUTTON_PIN, INPUT_PULLUP);
+  
+  APLastButtonState = digitalRead(AP_BUTTON_PIN);
   digitalWrite(D1, LOW);
   loadConfig();
   connectToWiFi();
   startMDNS();
   setupServer();
+
+  EEPROM.get(300, isLEDOn);
+    digitalWrite(D1, isLEDOn ? LOW : HIGH);
+
+    Serial.print("Light state on startup: ");
+    Serial.println(isLEDOn ? "ON" : "OFF");
 
   // Configure OTA
   ArduinoOTA.onStart([]() {
@@ -131,14 +157,27 @@ void setup() {
   writeTimeToSPIFFS(storedTimeInSeconds);
   Serial.println(F("Adjusted storedTimeInSeconds: ") + String(storedTimeInSeconds));
 
-  // Set up a Ticker to call a function that resets the watchdog timer every 30 minutes
-  ticker.attach(1800, []() {
-    saveState();
-    logMessage("INFO: Watchdog maintenance");
-    Serial.println(F("Restarting"));
-    ESP.restart();
-  });
+ if (watchdogIntervalMinutes == 0) {
+   logMessage("WARNING: watchdogIntervalMinutes is set to 0. Defaulting to 180 minutes.");
+   watchdogIntervalMinutes = 180; // Default to 180 minutes if set to 0
+   watchdogIntervalMinutes = watchdogIntervalMinutes = 3 * 60;
+ }
 
+Serial.println("watchdogIntervalMinutes: " + String(watchdogIntervalMinutes));
+
+ // Detach any existing ticker and attach the new one
+// restartTicker.detach();
+ restartTicker.attach(watchdogIntervalMinutes, []() {
+   if (storedTimeInSeconds > 0 || isLEDOn || isFree) {
+       logMessage("INFO: Watchdog maintenance skipped due to active timer or light on.");
+       Serial.println("Watchdog maintenance skipped due to active timer or light on.");
+   } else {
+       saveState();
+       logMessage("INFO: Watchdog maintenance");
+       Serial.println(F("Restarting"));
+       ESP.restart();
+   }
+ });
   lastMillis = millis();
 }
 
@@ -146,7 +185,10 @@ void loop() {
   server.handleClient();
   manageLEDTiming();
   ArduinoOTA.handle(); // Handle OTA updates
-  checkButtonPress(); // Check if the button is pressed
+  checkAPButtonPress(); // Check if the button is pressed
+  if (storedTimeInSeconds < 1) {
+    handleButtonPressCheck();
+  }
 //  checkWiFiConnection(); // Ensure WiFi is connected
 }
 
@@ -155,16 +197,32 @@ void connectToWiFi() {
     gateway.fromString(gatewayString);
     subnet.fromString(subnetString);
 
-    WiFi.config(local_IP, gateway, subnet);
-    WiFi.begin(ssid, password);
+    if (strlen(ssid) == 0 || strlen(password) == 0) {
+        Serial.println("No SSID and Password found. Starting AP mode.");
+        startAPMode();
+        return;  // Exit function to prevent further connection attempts
+    }
+
+    if (!local_IP.isSet() || !gateway.isSet() || !subnet.isSet()) {
+        Serial.println("Invalid IP configuration. Using DHCP.");
+        WiFi.begin(ssid, password);
+    } else {
+        WiFi.config(local_IP, gateway, subnet);
+        WiFi.begin(ssid, password);
+    }
+
     Serial.print(F("Connecting to WiFi "));
     int attempt = 0;
     while (WiFi.status() != WL_CONNECTED && attempt < 20) {
         delay(1000);
         digitalWrite(LED_BUILTIN, LOW);
+        digitalWrite(PROCESSING_LED_PIN, HIGH);
+        digitalWrite(AP_LED_PIN, LOW);
         Serial.print(F("."));
         delay(100);
         digitalWrite(LED_BUILTIN, HIGH);
+        digitalWrite(PROCESSING_LED_PIN, LOW);
+        digitalWrite(AP_LED_PIN, LOW);
         delay(100);
         attempt++;
     }
@@ -175,16 +233,33 @@ void connectToWiFi() {
         Serial.print(F("IP Address: "));
         Serial.println(WiFi.localIP());
         digitalWrite(LED_BUILTIN, LOW);
+        digitalWrite(PROCESSING_LED_PIN, HIGH);
+        digitalWrite(AP_LED_PIN, LOW);
     } else {
         Serial.println(F("Failed to connect to WiFi. Starting AP mode."));
-        WiFi.softAP(APSSID, APPass);
-        Serial.print(F("AP IP address: "));
-        Serial.println(WiFi.softAPIP());
-        digitalWrite(LED_BUILTIN, HIGH);
-        logMessage("Failed to connect to WiFi with SSID: " + String(ssid) + ". Starting AP mode.");
+        startAPMode();
     }
 }
 
+
+void startAPMode() {
+    digitalWrite(AP_LED_PIN, HIGH);
+    WiFi.softAP(APSSID, APPass);
+    Serial.print(F("AP IP address: "));
+    Serial.println(WiFi.softAPIP());
+    digitalWrite(LED_BUILTIN, HIGH);
+    digitalWrite(PROCESSING_LED_PIN, LOW);
+    logMessage("Failed to connect to WiFi with SSID: " + String(ssid) + ". Starting AP mode.");
+
+    // Start the web server
+    setupServer();
+
+    // Ensure the device does not attempt to restart the WiFi process
+    while (true) {
+        server.handleClient(); // Handle HTTP server requests
+        delay(100);
+    }
+}
 
 void startMDNS() {
   if (MDNS.begin(mDNSHostname)) {
@@ -196,39 +271,80 @@ void startMDNS() {
 }
 
 void loadConfig() {
-  EEPROM.get(0, ssid);
-  EEPROM.get(32, password);
-  EEPROM.get(64, serverAppDomain);
-  EEPROM.get(96, serverAppPort);
-  EEPROM.get(128, deviceName); 
-  EEPROM.get(160, isRegistered); 
-  EEPROM.get(161, ipString);
-  EEPROM.get(177, gatewayString);
-  EEPROM.get(193, subnetString);
-  EEPROM.get(209, isDisabled);
-  EEPROM.get(210, isPaused);
-  EEPROM.get(211, isFree);
-  EEPROM.get(224, deviceId); // Load deviceId from address 224
+    // Ensure buffers are clear before reading
+    memset(ssid, 0, sizeof(ssid));
+    memset(password, 0, sizeof(password));
+    memset(serverAppDomain, 0, sizeof(serverAppDomain));
+    memset(serverAppPort, 0, sizeof(serverAppPort));
+    memset(deviceName, 0, sizeof(deviceName));
+    memset(ipString, 0, sizeof(ipString));
+    memset(gatewayString, 0, sizeof(gatewayString));
+    memset(subnetString, 0, sizeof(subnetString));
 
-  snprintf(hostURL, sizeof(hostURL), "http://%s:%s", serverAppDomain, serverAppPort);
+    // Read data from EEPROM
+    EEPROM.get(0, ssid);
+    EEPROM.get(32, password);
+    EEPROM.get(64, serverAppDomain);
+    EEPROM.get(96, serverAppPort);
+    EEPROM.get(128, deviceName);
+    EEPROM.get(160, isRegistered);
+    EEPROM.get(161, ipString);
+    EEPROM.get(177, gatewayString);
+    EEPROM.get(193, subnetString);
+    EEPROM.get(209, isDisabled);
+    EEPROM.get(210, isPaused);
+    EEPROM.get(211, isFree);
+    EEPROM.get(224, deviceId);
+    EEPROM.get(312, watchdogIntervalMinutes);
+
+    // Null-terminate strings to ensure safe string operations
+    ssid[sizeof(ssid) - 1] = '\0';
+    password[sizeof(password) - 1] = '\0';
+    serverAppDomain[sizeof(serverAppDomain) - 1] = '\0';
+    serverAppPort[sizeof(serverAppPort) - 1] = '\0';
+    deviceName[sizeof(deviceName) - 1] = '\0';
+    ipString[sizeof(ipString) - 1] = '\0';
+    gatewayString[sizeof(gatewayString) - 1] = '\0';
+    subnetString[sizeof(subnetString) - 1] = '\0';
+
+    // Debug output to confirm values are being loaded
+    logMessage("Loaded Configuration:");
+    logMessage("SSID: " + String(ssid));
+    logMessage("Password: " + String(password));
+    logMessage("Server Domain: " + String(serverAppDomain));
+    logMessage("Server Port: " + String(serverAppPort));
+    logMessage("Device Name: " + String(deviceName));
+    logMessage("Static IP: " + String(ipString));
+    logMessage("Gateway: " + String(gatewayString));
+    logMessage("Subnet: " + String(subnetString));
+
+    snprintf(hostURL, sizeof(hostURL), "http://%s:%s", serverAppDomain, serverAppPort);
 }
+
 
 void saveConfig() {
-  EEPROM.put(0, ssid);
-  EEPROM.put(32, password);
-  EEPROM.put(64, serverAppDomain);
-  EEPROM.put(96, serverAppPort);
-  EEPROM.put(128, deviceName); 
-  EEPROM.put(160, isRegistered); 
-  EEPROM.put(161, ipString);
-  EEPROM.put(177, gatewayString);
-  EEPROM.put(193, subnetString);
-  EEPROM.put(209, isDisabled);
-  EEPROM.put(210, isPaused);
-  EEPROM.put(211, isFree);
-  EEPROM.put(224, deviceId); // Save deviceId at address 224
-  EEPROM.commit();
+    EEPROM.put(0, ssid);
+    EEPROM.put(32, password);
+    EEPROM.put(64, serverAppDomain);
+    EEPROM.put(96, serverAppPort);
+    EEPROM.put(128, deviceName);
+    EEPROM.put(160, isRegistered);
+    EEPROM.put(161, ipString);
+    EEPROM.put(177, gatewayString);
+    EEPROM.put(193, subnetString);
+    EEPROM.put(209, isDisabled);
+    EEPROM.put(210, isPaused);
+    EEPROM.put(211, isFree);
+    EEPROM.put(224, deviceId);
+    EEPROM.put(312, watchdogIntervalMinutes);
+    
+    if (EEPROM.commit()) {
+        Serial.println("Configuration saved.");
+    } else {
+        Serial.println("Error saving configuration to EEPROM.");
+    }
 }
+
 
 void setupServer() {
   server.on("/", HTTP_GET, []() {
@@ -717,6 +833,38 @@ server.on("/api/clearlogs", HTTP_DELETE, []() {
     }
 });
 
+
+server.on("/api/setWatchdogInterval", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+        String intervalStr = server.arg("plain");
+        int interval = intervalStr.toInt();
+        Serial.println("intervalStr: " + String(interval));
+        if (interval > 0) {
+            watchdogIntervalMinutes = interval * 60;
+            Serial.println("watchdogIntervalMinutes: " + String(watchdogIntervalMinutes));
+            saveConfig();
+            restartTicker.detach(); // Stop the previous ticker
+            restartTicker.attach(watchdogIntervalMinutes, []() {
+                if (storedTimeInSeconds > 0 || isLEDOn || isFree) {
+                    logMessage("INFO: Watchdog maintenance skipped due to active timer or light on.");
+                    Serial.println("Watchdog maintenance skipped due to active timer or light on.");
+                } else {
+                    saveState();
+                    logMessage("INFO: Watchdog maintenance");
+                    Serial.println(F("Restarting"));
+                    ESP.restart();
+                }
+            });
+            server.send(200, "text/plain", "Watchdog interval set to " + String(watchdogIntervalMinutes) + " minutes.");
+        } else {
+            server.send(400, "text/plain", "Invalid interval. Must be greater than 0.");
+        }
+    } else {
+        server.send(400, "text/plain", "No interval provided.");
+    }
+});
+
+
   server.begin();
   Serial.println("HTTP server started");
 }
@@ -917,6 +1065,7 @@ String generateHTML() {
 
 void registerDevice() {
   if (WiFi.status() == WL_CONNECTED) {
+    logMessage("INFO: Starting device registry...");
     WiFiClient client;
     HTTPClient http;
 
@@ -974,7 +1123,9 @@ void registerDevice() {
 
       isRegistered = true; 
       saveConfig(); 
+      logMessage("SUCCESS: Device registered!");
     } else {
+      logMessage("ERROR: Unable to register device");
       Serial.print(F("Error on sending POST: "));
       Serial.println(httpResponseCode);
     }
@@ -1031,6 +1182,7 @@ void saveState() {
   EEPROM.put(300, isLEDOn); // Save LED state
   EEPROM.put(304, millis()); // Save current time in millis
   EEPROM.put(308, storedTimeInSeconds); // Save remaining time
+  EEPROM.put(312, watchdogIntervalMinutes);
   EEPROM.commit();
   Serial.println("Saved state: millis = " + String(millis()) + ", storedTimeInSeconds = " + String(storedTimeInSeconds));
 }
@@ -1039,6 +1191,7 @@ void loadState() {
   EEPROM.get(300, isLEDOn);
   EEPROM.get(304, lastMillis); // Get the last recorded time in millis
   EEPROM.get(308, storedTimeInSeconds); // Load remaining time
+  EEPROM.get(312, watchdogIntervalMinutes);
   Serial.println("Loaded state: millis = " + String(lastMillis) + ", storedTimeInSeconds = " + String(storedTimeInSeconds));
 
   if (isLEDOn) {
@@ -1068,19 +1221,31 @@ void checkWiFiConnection() {
 }
 
 // Function to check if the button is pressed
-void checkButtonPress() {
-  bool currentButtonState = digitalRead(buttonPin);
-  
-  if (currentButtonState == LOW && lastButtonState == HIGH) { // Button pressed
-    Serial.println(F("Button pressed. Switching to AP mode."));
-    switchToAPMode();
+void checkAPButtonPress() {
+  bool APCurrentButtonState = digitalRead(AP_BUTTON_PIN);
+
+  if (APCurrentButtonState != APLastButtonState) {
+    APLastDebounceTime = millis();  // Reset debounce timer
+  }
+
+  if ((millis() - APLastDebounceTime) > APDebounceDelay) {
+    // Change detected, check for button press
+    if (APCurrentButtonState == LOW && !APButtonPressed) {
+      Serial.println(F("Button pressed. Switching to AP mode."));
+      switchToAPModeOnDemand();
+      APButtonPressed = true;  // Prevent re-triggering
+    } else if (APCurrentButtonState == HIGH && APButtonPressed) {
+      // Button released
+      APButtonPressed = false;  // Reset button pressed state
+    }
   }
   
-  lastButtonState = currentButtonState;
+  APLastButtonState = APCurrentButtonState;
 }
 
 // Function to switch to AP mode
-void switchToAPMode() {
+void switchToAPModeOnDemand() {
+  digitalWrite(AP_LED_PIN, HIGH);
   // Clear stored WiFi credentials
   memset(ssid, 0, sizeof(ssid));
   memset(password, 0, sizeof(password));
@@ -1089,4 +1254,22 @@ void switchToAPMode() {
   // Restart device to start in AP mode
   delay(1000);
   ESP.restart();
+}
+
+void handleButtonPressCheck() {
+    bool currentButtonState = digitalRead(PUSH_BUTTON_PIN);
+
+    if (storedTimeInSeconds > 0) {
+        // Timer is running, ignore button presses
+        Serial.println("Button pressed but light state unchanged due to active timer.");
+    } else {
+        // Control the light based on the button state
+        if (currentButtonState == LOW) {
+            // Button is pressed, turn on the light
+            digitalWrite(D1, HIGH);
+        } else {
+            // Button is released, turn off the light
+            digitalWrite(D1, LOW);
+        }
+    }
 }
