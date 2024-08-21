@@ -21,6 +21,7 @@ char serverAppPort[6] = "";
 const char* registerDeviceURL = "/api/device/insert";
 const char* updateDeviceURL = "/api/device/update";
 const char* stopDeviceTimeURL = "/api/device-time/end";
+const char* pauseDeviceTimeURL = "/api/device-time/pause";
 char deviceName[32] = "";
 int deviceId = 0;
 
@@ -35,7 +36,7 @@ char gatewayString[16] = "";
 char subnetString[16] = "";
 
 String manufacturerDeviceName = "Lightnode";
-String versionNumber = "1.0.1-0";
+String versionNumber = "1.0.0-0";
 String APSSID = manufacturerDeviceName + "-" + versionNumber + "-AP";
 String APPass = "L1ghtN0d3@2024";
 const char* mDNSHostname = "110lightnode"; 
@@ -68,11 +69,89 @@ unsigned int watchdogIntervalMinutes = 10;
 unsigned long lastMillis = 0; // Last recorded time
 unsigned long offDuration = 0; // Time duration the device was off
 
+unsigned long lastRetryTime = 0;
+const unsigned long retryInterval = 60000; // Retry every 60 seconds
+
 // Watchdog timer setup
 Ticker restartTicker;
 
 // Last state of the button
 bool APLastButtonState = HIGH;
+
+struct Request {
+    String method;
+    String url;
+    String payload;
+};
+
+std::vector<Request> requestQueue;
+
+void addToQueue(String method, String url, String payload) {
+    Request req = {method, url, payload};
+    requestQueue.push_back(req);
+}
+
+// Function to retry sending queued requests
+void retryQueuedRequests() {
+  Serial.println("retryQueuedRequests");
+  checkFileContent("/logs.txt");
+    for (auto it = requestQueue.begin(); it != requestQueue.end(); ) {
+        if (sendRequest(it->method, it->url, it->payload)) {
+            it = requestQueue.erase(it);  // Remove successful requests
+        } else {
+            ++it;  // Try the next request if current one fails
+        }
+    }
+}
+
+void checkFileContent(const char* filePath) {
+    File file = SPIFFS.open(filePath, "r");
+    
+    if (!file) {
+        Serial.println("Failed to open file for reading.");
+        return;
+    }
+
+    if (file.size() == 0) {
+        Serial.println("File is empty.");
+    } else {
+        Serial.println("File has content:");
+    }
+    
+    file.close();
+}
+
+bool sendRequest(String method, String url, String payload) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        WiFiClient client;
+
+        http.begin(client, url);
+        http.addHeader("Content-Type", "application/json");
+
+        int httpResponseCode = -1;
+
+        if (method == "POST") {
+            httpResponseCode = http.POST(payload);
+        } else if (method == "GET") {
+            httpResponseCode = http.GET();
+        }
+
+        if (httpResponseCode > 0) {
+            Serial.println("Server response: " + http.getString());
+            http.end();
+            return true;  // Request succeeded
+        } else {
+            Serial.println("Failed to send request, response code: " + String(httpResponseCode));
+            http.end();
+            return false;  // Request failed
+        }
+    } else {
+        Serial.println("No WiFi connection.");
+        return false;  // No WiFi connection
+    }
+}
+
 
 void setup() {
   Serial.begin(115200);
@@ -95,16 +174,17 @@ void setup() {
   
   APLastButtonState = digitalRead(AP_BUTTON_PIN);
   digitalWrite(D1, LOW);
+  
   loadConfig();
   connectToWiFi();
   startMDNS();
   setupServer();
 
   EEPROM.get(300, isLEDOn);
-    digitalWrite(D1, isLEDOn ? LOW : HIGH);
+  digitalWrite(D1, isLEDOn ? LOW : HIGH);
 
-    Serial.print("Light state on startup: ");
-    Serial.println(isLEDOn ? "ON" : "OFF");
+  Serial.print("Light state on startup: ");
+  Serial.println(isLEDOn ? "ON" : "OFF");
 
   // Configure OTA
   ArduinoOTA.onStart([]() {
@@ -149,11 +229,18 @@ void setup() {
   loadState();
 
   storedTimeInSeconds = readTimeFromSPIFFS();
-  unsigned long offDuration = calculateOffDuration();
-  storedTimeInSeconds -= offDuration;
+  loadStateAfterPowerInterrupt(readTimeFromSPIFFS());
+//  unsigned long offDuration = calculateOffDuration();
+//  storedTimeInSeconds -= offDuration;
   if (storedTimeInSeconds < 0) {
     storedTimeInSeconds = 0;
   }
+  Serial.println("After: " + String(storedTimeInSeconds));
+  EEPROM.put(308, readTimeFromSPIFFS()); // Save remaining time
+  EEPROM.commit();
+
+  EEPROM.get(308, storedTimeInSeconds);
+    
   writeTimeToSPIFFS(storedTimeInSeconds);
   Serial.println(F("Adjusted storedTimeInSeconds: ") + String(storedTimeInSeconds));
 
@@ -185,12 +272,71 @@ void loop() {
   server.handleClient();
   manageLEDTiming();
   ArduinoOTA.handle(); // Handle OTA updates
+
+  unsigned long currentTime = millis();
+  if (currentTime - lastRetryTime > retryInterval) {
+    retryQueuedRequests();
+    lastRetryTime = currentTime;
+  }
+    
   checkAPButtonPress(); // Check if the button is pressed
   if (storedTimeInSeconds < 1) {
     handleButtonPressCheck();
   }
 //  checkWiFiConnection(); // Ensure WiFi is connected
 }
+
+void loadStateAfterPowerInterrupt(int remTime) {
+    EEPROM.get(300, isLEDOn);
+    EEPROM.get(308, storedTimeInSeconds);
+    Serial.println("loadStateAfterPowerInterrupt: " + String(remTime));
+    if (remTime > 0 || isLEDOn) {
+        // Resume in a paused state if there was an interruption
+        isPaused = true;
+        EEPROM.put(210, isPaused);
+        digitalWrite(D1, LOW);  // Turn off the light
+        isLEDOn = false;
+        EEPROM.put(300, isLEDOn);
+        Serial.println("Resuming in paused state due to power interruption.");
+
+        notifyServerOfPause(remTime);
+    }
+}
+
+void notifyServerOfPause(int remTime) {
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFiClient client;
+        HTTPClient http;
+
+        int deviceId;
+        EEPROM.get(224, deviceId);  // Load the device ID from EEPROM
+
+        String fullURL = String(hostURL) + pauseDeviceTimeURL;  // Assuming the API is "/api/pause"
+        Serial.println("Sending pause request to server: " + fullURL);
+
+        http.begin(client, fullURL);
+        http.addHeader("Content-Type", "application/json");
+
+        // Prepare the JSON payload
+        String payload = "{\"device_id\": \"" + String(deviceId) + "\", \"remaining_time\": \"" + String(remTime) + "\"}";
+
+        // Send the request
+        int httpResponseCode = http.POST(payload);
+
+        if (httpResponseCode > 0) {
+            String response = http.getString();
+            Serial.println("Server response: " + response);
+        } else {
+            Serial.println("Error sending pause request: " + String(httpResponseCode));
+            addToQueue("POST", fullURL, payload);
+        }
+
+        http.end();
+    } else {
+        Serial.println("WiFi not connected. Cannot send pause status.");
+    }
+}
+
 
 void connectToWiFi() {
     local_IP.fromString(ipString);
@@ -529,7 +675,7 @@ server.on("/api/span", HTTP_GET, []() {
 
     // Attempt to update EEPROM
     isPaused = false;
-    EEPROM.put(177, isPaused);
+    EEPROM.put(210, isPaused);
     if (!EEPROM.commit()) {
         errorMessage = "Failed to commit paused state to EEPROM.";
         logMessage("Error: " + errorMessage);
@@ -1036,22 +1182,29 @@ String generateHTML() {
     page += "<button id='clearLogsBtn' onclick='clearLogs()'>Clear Error Log</button>"; // Button to clear logs
     page += "<script>";
     page += "function fetchLogs() {";
+    page += "  console.log('Fetching logs...');"; // Debugging log
     page += "  fetch('/api/logs')"; // Fetch logs from the endpoint
-    page += "    .then(response => response.text())";
+    page += "    .then(response => {";
+    page += "      if (!response.ok) { throw new Error('Network response was not ok'); }"; // Check for network error
+    page += "      return response.text();"; // Convert the response to text
+    page += "    })";
     page += "    .then(data => {";
-    page += "      document.getElementById('logs').innerHTML = `<pre>${data}</pre>`;";
+    page += "      console.log('Logs fetched:', data);"; // Debugging log for fetched data
+    page += "      document.getElementById('logs').innerHTML = '<pre>' + data + '</pre>';";
     page += "      document.getElementById('clearLogsBtn').style.display = 'block';"; // Show clear logs button
     page += "    })";
     page += "    .catch(error => console.error('Error fetching logs:', error));";
     page += "}";
     page += "function clearLogs() {";
+    page += "  console.log('Clearing logs...');"; // Debugging log
     page += "  fetch('/api/clearlogs', { method: 'DELETE' })"; // Send DELETE request to clear logs
     page += "    .then(response => {";
     page += "      if (response.ok) {";
     page += "        document.getElementById('logs').innerHTML = '<pre>Logs cleared.</pre>';";
-    page += "        console.log('Logs cleared successfully');";
+    page += "        document.getElementById('clearLogsBtn').style.display = 'none';"; // Hide the button again
+    page += "        console.log('Logs cleared successfully');"; // Debugging log
     page += "      } else {";
-    page += "        console.error('Failed to clear logs');";
+    page += "        console.error('Failed to clear logs');"; // Debugging log
     page += "      }";
     page += "    })";
     page += "    .catch(error => console.error('Error clearing logs:', error));";
@@ -1119,6 +1272,7 @@ void registerDevice() {
         Serial.println("Stored Device ID: " + String(deviceId));
       } else {
         Serial.println(F("Failed to parse JSON response"));
+        addToQueue("POST", String(hostURL) + registerDeviceURL, payload);
       }
 
       isRegistered = true; 
@@ -1126,6 +1280,7 @@ void registerDevice() {
       logMessage("SUCCESS: Device registered!");
     } else {
       logMessage("ERROR: Unable to register device");
+      addToQueue("POST", String(hostURL) + updateDeviceURL, payload); // Queue the request if failed
       Serial.print(F("Error on sending POST: "));
       Serial.println(httpResponseCode);
     }
@@ -1169,7 +1324,8 @@ void notifyServerOfTimeEnd() {
             String response = http.getString();
             Serial.println("Server notified successfully: " + response);
         } else {
-            Serial.println("Error notifying server: " + httpResponseCode);
+            logMessage("Failed to notify server, response code: " + String(httpResponseCode));
+            addToQueue("POST", fullURL, payload); // Queue the request if failed
         }
 
         http.end();
