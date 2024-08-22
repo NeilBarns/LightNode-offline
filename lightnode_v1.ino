@@ -12,6 +12,7 @@
 #define AP_BUTTON_PIN D2
 #define AP_LED_PIN D4
 #define PROCESSING_LED_PIN D8
+#define ERROR_LED_PIN D7
 
 // Configuration parameters
 char ssid[32] = "";
@@ -114,8 +115,10 @@ void checkFileContent(const char* filePath) {
 
     if (file.size() == 0) {
         Serial.println("File is empty.");
+        digitalWrite(ERROR_LED_PIN, LOW);
     } else {
         Serial.println("File has content:");
+        digitalWrite(ERROR_LED_PIN, HIGH);
     }
     
     file.close();
@@ -137,7 +140,7 @@ bool sendRequest(String method, String url, String payload) {
             httpResponseCode = http.GET();
         }
 
-        if (httpResponseCode > 0) {
+        if (httpResponseCode >= 200 && httpResponseCode < 300) {
             Serial.println("Server response: " + http.getString());
             http.end();
             return true;  // Request succeeded
@@ -167,10 +170,12 @@ void setup() {
   digitalWrite(D1, LOW);
   pinMode(AP_LED_PIN, OUTPUT);
   digitalWrite(AP_LED_PIN, LOW);
-  pinMode(PROCESSING_LED_PIN, OUTPUT);
+  pinMode(PROCESSING_LED_PIN, OUTPUT);  
   digitalWrite(PROCESSING_LED_PIN, LOW);
   pinMode(PUSH_BUTTON_PIN, INPUT_PULLUP);
   pinMode(AP_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ERROR_LED_PIN, OUTPUT);
+  digitalWrite(ERROR_LED_PIN, LOW);
   
   APLastButtonState = digitalRead(AP_BUTTON_PIN);
   digitalWrite(D1, LOW);
@@ -245,10 +250,11 @@ void setup() {
   Serial.println(F("Adjusted storedTimeInSeconds: ") + String(storedTimeInSeconds));
 
  if (watchdogIntervalMinutes == 0) {
-   logMessage("WARNING: watchdogIntervalMinutes is set to 0. Defaulting to 180 minutes.");
    watchdogIntervalMinutes = 180; // Default to 180 minutes if set to 0
    watchdogIntervalMinutes = watchdogIntervalMinutes = 3 * 60;
  }
+
+ checkFileContent("/logs.txt");
 
 Serial.println("watchdogIntervalMinutes: " + String(watchdogIntervalMinutes));
 
@@ -256,11 +262,9 @@ Serial.println("watchdogIntervalMinutes: " + String(watchdogIntervalMinutes));
 // restartTicker.detach();
  restartTicker.attach(watchdogIntervalMinutes, []() {
    if (storedTimeInSeconds > 0 || isLEDOn || isFree) {
-       logMessage("INFO: Watchdog maintenance skipped due to active timer or light on.");
        Serial.println("Watchdog maintenance skipped due to active timer or light on.");
    } else {
        saveState();
-       logMessage("INFO: Watchdog maintenance");
        Serial.println(F("Restarting"));
        ESP.restart();
    }
@@ -270,12 +274,14 @@ Serial.println("watchdogIntervalMinutes: " + String(watchdogIntervalMinutes));
 
 void loop() {
   server.handleClient();
-  manageLEDTiming();
+
+  manageLEDTiming();  
+  
   ArduinoOTA.handle(); // Handle OTA updates
 
   unsigned long currentTime = millis();
   if (currentTime - lastRetryTime > retryInterval) {
-    retryQueuedRequests();
+    //retryQueuedRequests();
     lastRetryTime = currentTime;
   }
     
@@ -323,11 +329,12 @@ void notifyServerOfPause(int remTime) {
         // Send the request
         int httpResponseCode = http.POST(payload);
 
-        if (httpResponseCode > 0) {
+        if (httpResponseCode >= 200 && httpResponseCode < 300) {
             String response = http.getString();
             Serial.println("Server response: " + response);
         } else {
             Serial.println("Error sending pause request: " + String(httpResponseCode));
+            digitalWrite(ERROR_LED_PIN, HIGH);
             addToQueue("POST", fullURL, payload);
         }
 
@@ -381,6 +388,15 @@ void connectToWiFi() {
         digitalWrite(LED_BUILTIN, LOW);
         digitalWrite(PROCESSING_LED_PIN, HIGH);
         digitalWrite(AP_LED_PIN, LOW);
+
+
+        if (SPIFFS.exists("/logs.txt")) {
+            if (SPIFFS.remove("/logs.txt")) {
+                Serial.println("Log file cleared successfully.");
+            }
+        }
+
+        
     } else {
         Serial.println(F("Failed to connect to WiFi. Starting AP mode."));
         startAPMode();
@@ -452,17 +468,6 @@ void loadConfig() {
     ipString[sizeof(ipString) - 1] = '\0';
     gatewayString[sizeof(gatewayString) - 1] = '\0';
     subnetString[sizeof(subnetString) - 1] = '\0';
-
-    // Debug output to confirm values are being loaded
-    logMessage("Loaded Configuration:");
-    logMessage("SSID: " + String(ssid));
-    logMessage("Password: " + String(password));
-    logMessage("Server Domain: " + String(serverAppDomain));
-    logMessage("Server Port: " + String(serverAppPort));
-    logMessage("Device Name: " + String(deviceName));
-    logMessage("Static IP: " + String(ipString));
-    logMessage("Gateway: " + String(gatewayString));
-    logMessage("Subnet: " + String(subnetString));
 
     snprintf(hostURL, sizeof(hostURL), "http://%s:%s", serverAppDomain, serverAppPort);
 }
@@ -857,6 +862,9 @@ server.on("/api/pause", HTTP_GET, []() {
       // Set the free state
       isFree = true;
       EEPROM.put(211, isFree);
+
+      // Turn on the light
+      digitalWrite(D1, HIGH);
   
       // Check if EEPROM commit is successful
       if (!EEPROM.commit()) {
@@ -864,10 +872,7 @@ server.on("/api/pause", HTTP_GET, []() {
           logMessage("Error: " + errorMessage);
           errorOccurred = true;
       }
-  
-      // Turn on the light
-      digitalWrite(D1, HIGH);
-  
+
       // Respond to the client
       if (errorOccurred) {
           server.send(500, "text/plain", "Failed to start free light.");
@@ -992,11 +997,9 @@ server.on("/api/setWatchdogInterval", HTTP_POST, []() {
             restartTicker.detach(); // Stop the previous ticker
             restartTicker.attach(watchdogIntervalMinutes, []() {
                 if (storedTimeInSeconds > 0 || isLEDOn || isFree) {
-                    logMessage("INFO: Watchdog maintenance skipped due to active timer or light on.");
                     Serial.println("Watchdog maintenance skipped due to active timer or light on.");
                 } else {
                     saveState();
-                    logMessage("INFO: Watchdog maintenance");
                     Serial.println(F("Restarting"));
                     ESP.restart();
                 }
@@ -1016,7 +1019,6 @@ server.on("/api/setWatchdogInterval", HTTP_POST, []() {
 }
 
 void manageLEDTiming() {
-
   if (isFree)
   {
     digitalWrite(D1, HIGH);
@@ -1218,7 +1220,6 @@ String generateHTML() {
 
 void registerDevice() {
   if (WiFi.status() == WL_CONNECTED) {
-    logMessage("INFO: Starting device registry...");
     WiFiClient client;
     HTTPClient http;
 
@@ -1252,7 +1253,7 @@ void registerDevice() {
     
     int httpResponseCode = http.POST(payload);
     Serial.println(httpResponseCode);
-    if (httpResponseCode > 0) {
+    if (httpResponseCode >= 200 && httpResponseCode < 300) {
       String response = http.getString();
       Serial.println(F("Device registered successfully: ") + response);
 
@@ -1272,14 +1273,15 @@ void registerDevice() {
         Serial.println("Stored Device ID: " + String(deviceId));
       } else {
         Serial.println(F("Failed to parse JSON response"));
+        digitalWrite(ERROR_LED_PIN, HIGH);
         addToQueue("POST", String(hostURL) + registerDeviceURL, payload);
       }
 
       isRegistered = true; 
       saveConfig(); 
-      logMessage("SUCCESS: Device registered!");
     } else {
       logMessage("ERROR: Unable to register device");
+      digitalWrite(ERROR_LED_PIN, HIGH);
       addToQueue("POST", String(hostURL) + updateDeviceURL, payload); // Queue the request if failed
       Serial.print(F("Error on sending POST: "));
       Serial.println(httpResponseCode);
@@ -1320,11 +1322,14 @@ void notifyServerOfTimeEnd() {
         payload += F("}");
         
         int httpResponseCode = http.POST(payload);
-        if (httpResponseCode > 0) {
+        if (httpResponseCode >= 200 && httpResponseCode < 300) {
             String response = http.getString();
             Serial.println("Server notified successfully: " + response);
+            delay(1000);
+            ESP.restart();
         } else {
             logMessage("Failed to notify server, response code: " + String(httpResponseCode));
+            digitalWrite(ERROR_LED_PIN, HIGH);
             addToQueue("POST", fullURL, payload); // Queue the request if failed
         }
 
@@ -1425,7 +1430,10 @@ void handleButtonPressCheck() {
             digitalWrite(D1, HIGH);
         } else {
             // Button is released, turn off the light
-            digitalWrite(D1, LOW);
+           if (!isFree) 
+           {
+              digitalWrite(D1, LOW);
+           }
         }
     }
 }
