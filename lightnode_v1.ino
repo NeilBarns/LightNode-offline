@@ -37,7 +37,7 @@ char gatewayString[16] = "";
 char subnetString[16] = "";
 
 String manufacturerDeviceName = "Lightnode";
-String versionNumber = "1.0.0-0";
+String versionNumber = "1.0.1-0";
 String APSSID = manufacturerDeviceName + "-" + versionNumber + "-AP";
 String APPass = "L1ghtN0d3@2024";
 const char* mDNSHostname = "110lightnode"; 
@@ -99,6 +99,8 @@ void retryQueuedRequests() {
     for (auto it = requestQueue.begin(); it != requestQueue.end(); ) {
         if (sendRequest(it->method, it->url, it->payload)) {
             it = requestQueue.erase(it);  // Remove successful requests
+            delay(5000);
+            ESP.restart();
         } else {
             ++it;  // Try the next request if current one fails
         }
