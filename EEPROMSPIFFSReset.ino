@@ -1,5 +1,8 @@
 #include <EEPROM.h>
 #include <FS.h>
+#include <WiFiManager.h>
+
+WiFiManager wifiManager;
 
 void setup() {
   Serial.begin(115200);
@@ -19,10 +22,11 @@ if (!SPIFFS.begin()) {
     return;
   }
 
-	SPIFFS.format();
+  SPIFFS.format();
 SPIFFS.end();
 
   Serial.println("EEPROM cleared.");
+  wifiManager.resetSettings();
 }
 
 void loop() {
